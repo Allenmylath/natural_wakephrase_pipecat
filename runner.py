@@ -1,164 +1,62 @@
-import asyncio
+#
+# Copyright (c) 2024, Daily
+#
+# SPDX-License-Identifier: BSD 2-Clause License
+#
+
 import aiohttp
+import argparse
 import os
-import sys
 
-from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.frames.frames import LLMMessagesFrame, TextFrame
-from pipecat.pipeline.pipeline import Pipeline
-from pipecat.pipeline.parallel_pipeline import ParallelPipeline
-from pipecat.pipeline.runner import PipelineRunner
-from pipecat.pipeline.task import PipelineParams, PipelineTask
-from pipecat.processors.aggregators.gated_openai_llm_context import GatedOpenAILLMContextAggregator
-from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
-from pipecat.processors.filters.null_filter import NullFilter
-from pipecat.processors.filters.wake_check_filter import WakeCheckFilter
-from pipecat.processors.filters.wake_notifier_filter import WakeNotifierFilter
-from pipecat.processors.user_idle_processor import UserIdleProcessor
-from pipecat.services.cartesia import CartesiaTTSService
-from pipecat.services.deepgram import DeepgramSTTService
-from pipecat.services.openai import OpenAILLMService
-from pipecat.sync.event_notifier import EventNotifier
-from pipecat.transports.services.daily import DailyParams, DailyTransport
-
-from runner import configure
-
-from loguru import logger
-
-from dotenv import load_dotenv
-
-load_dotenv(override=True)
-
-logger.remove(0)
-logger.add(sys.stderr, level="DEBUG")
+from pipecat.transports.services.helpers.daily_rest import DailyRESTHelper
 
 
-async def main():
-    async with aiohttp.ClientSession() as session:
-        (room_url, _) = await configure(session)
+async def configure(aiohttp_session: aiohttp.ClientSession):
+    (url, token, _) = await configure_with_args(aiohttp_session)
+    return (url, token)
 
-        transport = DailyTransport(
-            room_url,
-            None,
-            "Respond bot",
-            DailyParams(
-                audio_out_enabled=True,
-                vad_enabled=True,
-                vad_analyzer=SileroVADAnalyzer(),
-                vad_audio_passthrough=True,
-            ),
+
+async def configure_with_args(
+    aiohttp_session: aiohttp.ClientSession, parser: argparse.ArgumentParser | None = None
+):
+    if not parser:
+        parser = argparse.ArgumentParser(description="Daily AI SDK Bot Sample")
+    parser.add_argument(
+        "-u", "--url", type=str, required=False, help="URL of the Daily room to join"
+    )
+    parser.add_argument(
+        "-k",
+        "--apikey",
+        type=str,
+        required=False,
+        help="Daily API Key (needed to create an owner token for the room)",
+    )
+
+    args, unknown = parser.parse_known_args()
+
+    url = args.url or os.getenv("DAILY_SAMPLE_ROOM_URL")
+    key = args.apikey or os.getenv("DAILY_API_KEY")
+
+    if not url:
+        raise Exception(
+            "No Daily room specified. use the -u/--url option from the command line, or set DAILY_SAMPLE_ROOM_URL in your environment to specify a Daily room URL."
         )
 
-        stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
-
-        tts = CartesiaTTSService(
-            api_key=os.getenv("CARTESIA_API_KEY"),
-            voice_id="79a125e8-cd45-4c13-8a67-188112f4dd22",  # British Lady
+    if not key:
+        raise Exception(
+            "No Daily API key specified. use the -k/--apikey option from the command line, or set DAILY_API_KEY in your environment to specify a Daily API key, available from https://dashboard.daily.co/developers."
         )
 
-        # Add wake phrase filter
-        hey_robot_filter = WakeCheckFilter(["hey robot", "hey, robot"])
+    daily_rest_helper = DailyRESTHelper(
+        daily_api_key=key,
+        daily_api_url=os.getenv("DAILY_API_URL", "https://api.daily.co/v1"),
+        aiohttp_session=aiohttp_session,
+    )
 
-        # This is the LLM that will be used to detect if the user has finished a
-        # statement. This doesn't really need to be an LLM, we could use NLP
-        # libraries for that, but it was easier as an example because we
-        # leverage the context aggregators.
-        statement_llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4o")
+    # Create a meeting token for the given room with an expiration 1 hour in
+    # the future.
+    expiry_time: float = 60 * 60
 
-        statement_messages = [
-            {
-                "role": "system",
-                "content": "Determine if the user's statement is a complete sentence or question, ending in a natural pause or punctuation. Return 'YES' if it is complete and 'NO' if it seems to leave a thought unfinished.",
-            },
-        ]
+    token = await daily_rest_helper.get_token(url, expiry_time)
 
-        statement_context = OpenAILLMContext(statement_messages)
-        statement_context_aggregator = statement_llm.create_context_aggregator(statement_context)
-
-        # This is the regular LLM.
-        llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4o")
-
-        messages = [
-            {
-                "role": "system",
-                "content": "You are a helpful LLM in a WebRTC call. Your goal is to demonstrate your capabilities in a succinct way. Your output will be converted to audio so don't include special characters in your answers. Respond to what the user said in a creative and helpful way.",
-            },
-        ]
-
-        context = OpenAILLMContext(messages)
-        context_aggregator = llm.create_context_aggregator(context)
-
-        # We have instructed the LLM to return 'YES' if it thinks the user
-        # completed a sentence. So, if it's 'YES' we will return true in this
-        # predicate which will wake up the notifier.
-        async def wake_check_filter(frame):
-            return frame.text == "YES"
-
-        # This is a notifier that we use to synchronize the two LLMs.
-        notifier = EventNotifier()
-
-        # This a filter that will wake up the notifier if the given predicate
-        # (wake_check_filter) returns true.
-        completness_check = WakeNotifierFilter(
-            notifier, types=(TextFrame,), filter=wake_check_filter
-        )
-
-        # This processor keeps the last context and will let it through once the
-        # notifier is woken up.
-        gated_context_aggregator = GatedOpenAILLMContextAggregator(notifier)
-
-        # Notify if the user hasn't said anything.
-        async def user_idle_notifier(frame):
-            await notifier.notify()
-
-        # Sometimes the LLM will fail detecting if a user has completed a
-        # sentence, this will wake up the notifier if that happens.
-        user_idle = UserIdleProcessor(callback=user_idle_notifier, timeout=3.0)
-
-        # Modified pipeline to include wake phrase detection
-        pipeline = Pipeline(
-            [
-                transport.input(),  # Transport user input
-                stt,
-                hey_robot_filter,  # Add wake phrase filter here
-                ParallelPipeline(
-                    [
-                        statement_context_aggregator.user(),
-                        statement_llm,
-                        completness_check,
-                        NullFilter(),
-                    ],
-                    [context_aggregator.user(), gated_context_aggregator, llm],
-                ),
-                user_idle,
-                tts,  # TTS
-                transport.output(),  # Transport bot output
-                context_aggregator.assistant(),  # Assistant spoken responses
-            ]
-        )
-
-        task = PipelineTask(
-            pipeline,
-            PipelineParams(
-                allow_interruptions=True,
-                enable_metrics=True,
-                enable_usage_metrics=True,
-                report_only_initial_ttfb=True,
-            ),
-        )
-
-        @transport.event_handler("on_first_participant_joined")
-        async def on_first_participant_joined(transport, participant):
-            await transport.capture_participant_transcription(participant["id"])
-            # Modified initial message to include wake phrase instruction
-            await tts.say("Hi! If you want to talk to me, just say 'Hey Robot'.")
-            messages.append({"role": "system", "content": "Please wait for the user to say 'Hey Robot' before responding."})
-            await task.queue_frames([LLMMessagesFrame(messages)])
-
-        runner = PipelineRunner()
-
-        await runner.run(task)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    return (url, token, args)
